@@ -1,25 +1,33 @@
--- 00d40f681a707d55d0d7b9af25bc761b.fxo
-
 assert("Lua 5.3" == _VERSION)
 assert(arg[1], "\n\n[ERROR] no input file\n\n")
-local DEBUG = arg[2] or ""
+local DEBUG = arg[2] or nil
 
 require("mod_binary_reader")
 local r = BinaryReader
 
+local zlib = require("zlib")
 
-local function get_blockheader()
+
+local VER22 = false
+
+
+local function get_blockheader(offset)
     local b = {}
     local flags = r:uint32()
-    b.count = r:uint32()
-    b.size_z = r:uint64()
-    b.size = r:uint64()
-    b.next = r:uint64()
-
+    b.count  = r:uint32()
+    b.size_z = VER22 and r:uint64() or r:uint32()
+    b.size   = VER22 and r:uint64() or r:uint32()
+    b.next   = VER22 and r:uint64() or r:uint32()
+    
+    b.offset = offset - b.size_z
     b.compressed = (flags & 1 > 0) and true or false
     b.encrypted  = (flags & 2 > 0) and true or false
     b.havedata   = (flags & 4 > 0) and true or false
     b.deleted    = (flags & 8 > 0) and true or false
+    
+    if b.havedata then
+        b.offset = b.offset - (VER22 and 16 or 8)
+    end
 
     local t = {}
     t[1] = (b.compressed) and "C" or "-"
@@ -32,26 +40,45 @@ local function get_blockheader()
 end
 
 
-local function decode(offset, size_z, size)
-    local key = 0x71c71c71
-    local t = {}
+local function unlz(offset, size_z, size)
+    local stream = zlib.inflate()
+    
     r:seek(offset)
+    local data = r:str(size_z)
+    local eof, b_in, b_out
+    data, eof, b_in, b_out = stream(data)
+    
+    assert(true == eof)
+    assert(size_z == b_in)
+    assert(size == b_out)
 
-    for x = 2, size_z, 2 do
+    return data
+end
+
+
+local function decode(offset, size_z)
+    local key = VER22 and 0x71c71c71 or 0x000A2C2A
+    local t = {}
+    
+    r:seek(offset)
+    for _ = 2, size_z, 2 do
         key = key * 0x00343fd
         key = key + 0x00269ec3
         local tmp_key = (key >> 16) & 0x7fff
         local tmp_str = r:uint16() ~ tmp_key
         table.insert(t, string.pack("H", tmp_str))
     end
+    
     return table.concat(t)
 end
 
 
-local function get_fileheader(M, pos)
+local function get_fileheader(data, pos)
+    pos = (pos - 1) * (VER22 and 560 or 540) + 1
+
     local t = {}
     for i = pos, pos+519, 2 do
-        local char = string.sub(M, i, i)
+        local char = string.sub(data, i, i)
         if char == "\0" then break end
         table.insert(t, char)
     end
@@ -59,11 +86,14 @@ local function get_fileheader(M, pos)
 
     local f = {}
     f.name = table.concat(t)
-    f.offset, pos = string.unpack("I8", M, pos)
-    f.size_z, pos = string.unpack("I8", M, pos)
-    f.size, pos = string.unpack("I8", M, pos)
-    f.filetime, pos = string.unpack("I", M, pos)
-    f.unknown = string.unpack("c12", M, pos)
+    
+    local SZ = VER22 and "I8" or "I"
+    f.offset, pos = string.unpack(SZ, data, pos)
+    f.size_z, pos = string.unpack(SZ, data, pos)
+    f.size, pos = string.unpack(SZ, data, pos)
+    f.filetime, pos = string.unpack(SZ, data, pos)
+    f.unknown = string.unpack(SZ, data, pos)
+--    assert("\0\0\0\0\0\0\0\0\0\0\0\0" == f.unknown)
 
     return f
 end
@@ -72,82 +102,77 @@ end
 --[[ main ]]--
 
 r:open(arg[1])
-r:idstring("Resource File V2.2")
-r:seek(0x310)
 
+if "Reso" == r:str(4) then
+    VER22 = true
+end
+
+local jmp
+if VER22 then
+    r:seek(0x310)
+    jmp = r:uint64()
+else
+    jmp = 0x0404
+end
 local rda_size = r:size()
-local jmp = r:uint64()
 
-while jmp < rda_size do
-    r:seek(jmp)
-
-    local block = get_blockheader()
-    local offset = jmp - block.size_z
+while r:seek(jmp) < rda_size do
+    local block = get_blockheader(jmp)
+    
+    if not DEBUG then
+        print(jmp, block.parsedflags, block.count, block.size_z, block.size, block.next)
+    end
     jmp = block.next
 
-print(offset, block.parsedflags, block.count, block.size_z, block.size)
+    if block.size == 0 or not DEBUG then goto nextblock end
 
-    if block.size == 0 then goto nextblock end
+    local fileheader, filedata
 
-    if block.havedata then
-        offset = offset - 16
-    end
-
-    local M1
-    if block.encrypted then
-        M1 = decode(offset, block.size_z, block.size)
-    else
-        r:seek(offset)
-        M1 = r:str(block.size_z)
-    end
     if block.compressed then
---        M1 = unlz(M1, size_z, size)
-    end
+        fileheader = unlz(block.offset, block.size_z, block.size)
 
+    elseif block.encrypted then
+        fileheader = decode(block.offset, block.size_z)
 
-    -- TODO: нефиг копировать если не шифровано/упаковано
-    local M2
-    if block.havedata then
-        r:seek(offset + block.size_z)
+    elseif block.havedata then
+        r:seek(block.offset)
+        fileheader = r:str(block.size_z)
+
         local size_z = r:uint64()
         local size = r:uint64()
-        offset = offset - size_z
+        r:seek(block.offset - size_z)
+        filedata = r:str(size_z)
 
-        if block.encrypted then
-            M2 = decode(offset, size_z, size)
-        else
-            r:seek(offset)
-            M2 = r:str(size_z)
-        end
-        if block.compressed then
---            M2 = unlz(M2, size_z, size)
-        end
+    else    -- and if (block.deleted)
+        r:seek(block.offset)
+        fileheader = r:str(block.size_z)
     end
 
     for i = 1, block.count do
-        local file = get_fileheader(M1, (i-1)*560+1)
+        local file = get_fileheader(fileheader, i)
 
-        print(("%4d | %10d | %9d | %9d | %s | %s"):format(
-                i, file.offset, file.size_z, file.size,
-                os.date("%Y-%m-%d %H:%M:%S", file.filetime), file.name))
+        if DEBUG then
+            print(("%s,%s,%d,%d,%d,%s,%s"):format(
+                    DEBUG, block.parsedflags, file.offset, file.size_z, file.size,
+                    os.date("%Y-%m-%d %H:%M:%S", file.filetime), file.name))
+        end
 
         if file.size == 0 then goto nextfile end
 
-        if block.havedata then
-            -- copy M2 -> file
+        if block.compressed then
+            -- unlz from filedata -> file
+        elseif block.encrypted then
+            -- decode(file.offset, file.size_z)
+        elseif block.havedata then
+            -- copy from filedata -> file
+        elseif block.deleted then
+            -- delete file
         else
-            if block.encrypted then
---                decode(file.offset, file.size_z, file.size)
-            else
---                r:seek(file.offset)
-            end
-            if block.compressed then
-                -- unlz M2 -> file
-            end
+            -- copy from input -> file
         end
+
         ::nextfile::
     end
-
     ::nextblock::
 end
 
